@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 自定义绑定权限：仅声明了该权限的客户端可以绑定调度服务。
+         protectionLevel=normal：任意应用可声明（便于 3 个客户端测试）；
+         正式场景可改为 signature，要求服务端与客户端使用同一签名。 -->
+    <permission
+        android:name="com.tasklinker.permission.BIND_TASK_SCHEDULER"
+        android:protectionLevel="normal" />
+
+    <uses-permission android:name="com.tasklinker.permission.BIND_TASK_SCHEDULER" />
+
+    <application
+        android:allowBackup="true"
+        android:label="TaskLinker Server"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 任务调度服务：
+             - android:process=":scheduler"：运行在独立进程（与主进程隔离，演示"跨进程"）
+             - android:exported="true"：允许其他应用绑定
+             - android:permission：绑定方必须持有自定义权限
+             - intent-filter + action：配合客户端显式 Intent（setPackage）绑定 -->
+        <service
+            android:name=".TaskSchedulerService"
+            android:exported="true"
+            android:permission="com.tasklinker.permission.BIND_TASK_SCHEDULER"
+            android:process=":scheduler">
+            <intent-filter>
+                <action android:name="com.tasklinker.api.action.TASK_SCHEDULER" />
+            </intent-filter>
+        </service>
+    </application>
+
+</manifest>
