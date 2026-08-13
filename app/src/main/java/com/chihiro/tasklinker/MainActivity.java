@@ -1,6 +1,7 @@
 package com.chihiro.tasklinker;
 
 import android.os.Bundle;
+import android.speech.tts.TextToSpeech;
 import android.view.View;
 import android.widget.ArrayAdapter;
 import android.widget.CheckBox;
@@ -30,8 +31,8 @@ import java.util.Map;
 /**
  * 客户端主界面，三种角色可切换（同一份代码，3 个 flavor 可同时安装）：
  *  - 取号机：取号（普通号/优先号）
- *  - 医生工作站：叫下一位 / 就诊完成 / 过号
- *  - 叫号大屏：实时显示当前叫号与等待队列（服务端每次状态变化自动刷新）
+ *  - 医生工作站：双诊室并发叫号 / 就诊完成 / 过号（过号自动放回队尾）
+ *  - 叫号大屏：实时显示各诊室当前就诊与等待队列，支持语音播报叫号
  *
  * 默认角色按 flavor 区分：TaskClient A → 取号机，B → 医生工作站，C → 叫号大屏。
  */
@@ -55,10 +56,13 @@ public class MainActivity extends AppCompatActivity {
 
     // 医生工作站
     private Spinner spDeptDoctor;
-    private TextView tvCurrent;
+    private Spinner spRoom;
+    private TextView tvRoom1;
+    private TextView tvRoom2;
 
     // 叫号大屏
     private Spinner spDeptDisplay;
+    private CheckBox cbVoice;
     private TextView tvNowServing;
     private RecyclerView rvQueue;
 
@@ -70,12 +74,16 @@ public class MainActivity extends AppCompatActivity {
     private EventLogAdapter logAdapter;
     private EventLogAdapter queueAdapter;
 
-    /** 各科室当前就诊中的号（由服务端 CALLING 回调维护，主线程访问） */
-    private final Map<String, TicketInfo> currentByDept = new HashMap<>();
+    /** 各科室各诊室当前就诊中的号（由服务端 CALLING 回调维护，主线程访问），key = 科室#诊室号 */
+    private final Map<String, TicketInfo> currentByRoom = new HashMap<>();
 
     private TaskSchedulerConnection connection;
     private int role = ROLE_TAKE;
     private final SimpleDateFormat timeFormat = new SimpleDateFormat("HH:mm:ss", Locale.getDefault());
+
+    // 语音播报（叫号大屏角色使用）
+    private TextToSpeech tts;
+    private boolean ttsReady;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -94,9 +102,12 @@ public class MainActivity extends AppCompatActivity {
         tvTakeResult = findViewById(R.id.tvTakeResult);
 
         spDeptDoctor = findViewById(R.id.spDeptDoctor);
-        tvCurrent = findViewById(R.id.tvCurrent);
+        spRoom = findViewById(R.id.spRoom);
+        tvRoom1 = findViewById(R.id.tvRoom1);
+        tvRoom2 = findViewById(R.id.tvRoom2);
 
         spDeptDisplay = findViewById(R.id.spDeptDisplay);
+        cbVoice = findViewById(R.id.cbVoice);
         tvNowServing = findViewById(R.id.tvNowServing);
         rvQueue = findViewById(R.id.rvQueue);
 
@@ -116,6 +127,13 @@ public class MainActivity extends AppCompatActivity {
         spDeptDoctor.setAdapter(deptAdapter);
         spDeptDisplay.setAdapter(deptAdapter);
 
+        ArrayAdapter<String> roomAdapter = new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_item, HospitalDepartments.ROOM_NAMES);
+        roomAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        spRoom.setAdapter(roomAdapter);
+
+        initTts();
+
         // 连接管理类：所有回调已切换到主线程，可直接更新 UI
         connection = new TaskSchedulerConnection(this, new TaskSchedulerConnection.Listener() {
             @Override
@@ -126,7 +144,7 @@ public class MainActivity extends AppCompatActivity {
                     resyncFromServer(); // 重连后从服务端拉取真实状态，修复本地缓存
                 } else {
                     // 断线期间本地"当前就诊"缓存不可信，清空
-                    currentByDept.clear();
+                    currentByRoom.clear();
                     updateDoctorPanel();
                     refreshQueue();
                 }
@@ -134,12 +152,16 @@ public class MainActivity extends AppCompatActivity {
 
             @Override
             public void onTicketStateChanged(TicketInfo t) {
-                // 服务端广播的每一次状态变化：取号/叫号/完成/过号/退号
+                // 服务端广播的每一次状态变化：取号/叫号/完成/过号重排/退号
                 appendLog(describe(t));
                 if (t.state == TicketState.CALLING) {
-                    currentByDept.put(t.department, t);
-                } else if (t.state == TicketState.FINISHED || t.state == TicketState.SKIPPED) {
-                    currentByDept.remove(t.department);
+                    currentByRoom.put(keyOf(t), t);
+                    // 叫号大屏语音播报
+                    if (role == ROLE_DISPLAY && cbVoice.isChecked() && ttsReady) {
+                        announce(t);
+                    }
+                } else {
+                    removeByTicketId(t.ticketId); // 号离开诊室（完成/过号重排），清本地缓存
                 }
                 updateDoctorPanel();
                 if (role == ROLE_DISPLAY) refreshQueue(); // 大屏实时刷新
@@ -166,11 +188,12 @@ public class MainActivity extends AppCompatActivity {
         findViewById(R.id.btnCallNext).setOnClickListener(v -> callNext());
         findViewById(R.id.btnComplete).setOnClickListener(v -> completeOrSkip(false));
         findViewById(R.id.btnSkip).setOnClickListener(v -> completeOrSkip(true));
-        spDeptDoctor.setOnItemSelectedListener(new SimpleSelectedListener(() -> updateDoctorPanel()));
+        spDeptDoctor.setOnItemSelectedListener(new SimpleSelectedListener(this::updateDoctorPanel));
+        spRoom.setOnItemSelectedListener(new SimpleSelectedListener(this::updateDoctorPanel));
 
         // ---- 叫号大屏 ----
         findViewById(R.id.btnRefresh).setOnClickListener(v -> refreshQueue());
-        spDeptDisplay.setOnItemSelectedListener(new SimpleSelectedListener(() -> refreshQueue()));
+        spDeptDisplay.setOnItemSelectedListener(new SimpleSelectedListener(this::refreshQueue));
 
         appendLog("本客户端: " + getPackageName() + "（默认角色："
                 + (role == ROLE_TAKE ? "取号机" : role == ROLE_DOCTOR ? "医生工作站" : "叫号大屏") + "）");
@@ -183,18 +206,71 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         if (connection != null) connection.disconnect();
+        if (tts != null) {
+            tts.stop();
+            tts.shutdown();
+        }
         super.onDestroy();
     }
 
+    // ---------------- 语音播报 ----------------
+
+    private void initTts() {
+        tts = new TextToSpeech(this, status -> {
+            if (status != TextToSpeech.SUCCESS) {
+                appendLog("语音播报引擎初始化失败");
+                return;
+            }
+            int result = tts.setLanguage(Locale.CHINA);
+            ttsReady = result != TextToSpeech.LANG_MISSING_DATA && result != TextToSpeech.LANG_NOT_SUPPORTED;
+            if (!ttsReady) {
+                appendLog("语音播报不可用：设备缺少中文语音数据");
+            }
+        });
+    }
+
+    /** 播报叫号："请 A零零三 号，患者A，到 内科 2号诊室 就诊" */
+    private void announce(TicketInfo t) {
+        String text = "请 " + toChineseDigits(t.ticketNo) + " 号，" + t.patientName
+                + "，到 " + t.department + HospitalDepartments.roomNameOf(t.roomNo) + " 就诊";
+        appendLog("🔊 " + text);
+        tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "call-" + t.ticketId);
+    }
+
+    /** 数字转中文读法（"A-003" → "A零零三"），让 TTS 朗读更自然 */
+    private static String toChineseDigits(String s) {
+        final char[] CN = {'零', '一', '二', '三', '四', '五', '六', '七', '八', '九'};
+        StringBuilder sb = new StringBuilder();
+        for (char c : s.toCharArray()) {
+            sb.append(c >= '0' && c <= '9' ? CN[c - '0'] : c);
+        }
+        return sb.toString();
+    }
+
+    // ---------------- 连接恢复 ----------------
+
     /** 连接（重连）建立后，从服务端拉取真实状态，修复断线期间失真的本地缓存 */
     private void resyncFromServer() {
-        String dept = (String) spDeptDoctor.getSelectedItem();
-        List<TicketInfo> list = connection == null ? null : connection.queryQueue(dept);
-        if (list != null && !list.isEmpty() && list.get(0).state == TicketState.CALLING) {
-            currentByDept.put(dept, list.get(0)); // 恢复"当前就诊"
+        for (String dept : HospitalDepartments.ALL) {
+            List<TicketInfo> list = connection == null ? null : connection.queryQueue(dept);
+            if (list != null) {
+                for (TicketInfo t : list) {
+                    if (t.state == TicketState.CALLING) {
+                        currentByRoom.put(keyOf(t), t);
+                    }
+                }
+            }
         }
         updateDoctorPanel();
         if (role == ROLE_DISPLAY) refreshQueue();
+    }
+
+    private static String keyOf(TicketInfo t) {
+        return t.department + "#" + t.roomNo;
+    }
+
+    private void removeByTicketId(int ticketId) {
+        currentByRoom.entrySet().removeIf(e -> e.getValue().ticketId == ticketId);
     }
 
     private void showPanels() {
@@ -227,22 +303,25 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    // ---------------- 医生工作站 ----------------
+    // ---------------- 医生工作站（多诊室） ----------------
 
     private void callNext() {
         String department = (String) spDeptDoctor.getSelectedItem();
-        int id = connection == null ? -1 : connection.callNext(department);
+        int roomNo = spRoom.getSelectedItemPosition() + 1;
+        int id = connection == null ? -1 : connection.callNext(department, roomNo);
         if (id <= 0) {
-            appendLog("叫号失败（" + department + "）：队列为空或当前患者尚未完成/过号");
+            appendLog("叫号失败（" + department + HospitalDepartments.roomNameOf(roomNo)
+                    + "）：该诊室有患者或队列为空");
         }
         updateDoctorPanel();
     }
 
     private void completeOrSkip(boolean skip) {
         String department = (String) spDeptDoctor.getSelectedItem();
-        TicketInfo cur = currentByDept.get(department);
+        int roomNo = spRoom.getSelectedItemPosition() + 1;
+        TicketInfo cur = currentByRoom.get(department + "#" + roomNo);
         if (cur == null) {
-            Toast.makeText(this, "该科室当前没有就诊中的号", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, HospitalDepartments.roomNameOf(roomNo) + "当前没有就诊中的号", Toast.LENGTH_SHORT).show();
             return;
         }
         boolean ok = connection != null
@@ -252,10 +331,14 @@ public class MainActivity extends AppCompatActivity {
 
     private void updateDoctorPanel() {
         String department = (String) spDeptDoctor.getSelectedItem();
-        TicketInfo cur = currentByDept.get(department);
-        tvCurrent.setText(cur == null ? "当前就诊：无"
-                : "当前就诊：" + cur.ticketNo + "  " + cur.patientName
-                + "（" + TicketPriority.nameOf(cur.priority) + "）");
+        for (int roomNo = 1; roomNo <= HospitalDepartments.ROOMS_PER_DEPARTMENT; roomNo++) {
+            TicketInfo cur = currentByRoom.get(department + "#" + roomNo);
+            TextView tv = roomNo == 1 ? tvRoom1 : tvRoom2;
+            String text = HospitalDepartments.roomNameOf(roomNo) + "："
+                    + (cur == null ? "空闲" : cur.ticketNo + "  " + cur.patientName
+                    + (cur.skippedCount > 0 ? "（过号" + cur.skippedCount + "次）" : ""));
+            tv.setText(text);
+        }
     }
 
     // ---------------- 叫号大屏 ----------------
@@ -265,23 +348,31 @@ public class MainActivity extends AppCompatActivity {
         List<TicketInfo> list = connection == null ? null : connection.queryQueue(department);
         queueItems.clear();
         if (list == null || list.isEmpty()) {
-            tvNowServing.setText("当前叫号：无");
+            tvNowServing.setText("当前就诊：无");
         } else {
-            int start = 0;
-            if (list.get(0).state == TicketState.CALLING) {
-                TicketInfo cur = list.get(0);
-                tvNowServing.setText("当前叫号：" + cur.ticketNo + "  " + cur.patientName
-                        + "（" + TicketPriority.nameOf(cur.priority) + "）");
-                queueItems.add("▶ " + cur.ticketNo + "  " + cur.patientName + "（就诊中）");
-                start = 1;
-            } else {
-                tvNowServing.setText("当前叫号：无");
+            List<TicketInfo> calling = new ArrayList<>();
+            List<TicketInfo> waiting = new ArrayList<>();
+            for (TicketInfo t : list) {
+                if (t.state == TicketState.CALLING) calling.add(t);
+                else waiting.add(t);
             }
-            for (int i = start; i < list.size(); i++) {
-                TicketInfo t = list.get(i);
-                queueItems.add(String.format(Locale.getDefault(), "%s  %s  %s",
+            if (calling.isEmpty()) {
+                tvNowServing.setText("当前就诊：无");
+            } else {
+                StringBuilder sb = new StringBuilder("当前就诊：");
+                for (TicketInfo t : calling) {
+                    sb.append("\n").append(HospitalDepartments.roomNameOf(t.roomNo))
+                            .append("  ").append(t.ticketNo).append("  ").append(t.patientName);
+                    queueItems.add("▶ " + HospitalDepartments.roomNameOf(t.roomNo)
+                            + "  " + t.ticketNo + "  " + t.patientName + "（就诊中）");
+                }
+                tvNowServing.setText(sb.toString());
+            }
+            for (TicketInfo t : waiting) {
+                queueItems.add(String.format(Locale.getDefault(), "%s  %s  %s%s",
                         t.ticketNo, t.patientName,
-                        t.priority >= TicketPriority.PRIORITY ? "[优先]" : ""));
+                        t.priority >= TicketPriority.PRIORITY ? "[优先] " : "",
+                        t.skippedCount > 0 ? "过号" + t.skippedCount + "次" : ""));
             }
         }
         queueAdapter.notifyDataSetChanged();
@@ -292,15 +383,17 @@ public class MainActivity extends AppCompatActivity {
     private String describe(TicketInfo t) {
         switch (t.state) {
             case TicketState.WAITING:
+                if (t.skippedCount > 0) {
+                    return String.format(Locale.getDefault(), "过号重排（第%d次）回到队尾：%s %s %s",
+                            t.skippedCount, t.ticketNo, t.patientName, t.department);
+                }
                 return String.format(Locale.getDefault(), "取号 %s %s（%s·%s）排队中",
                         t.ticketNo, t.patientName, t.department, TicketPriority.nameOf(t.priority));
             case TicketState.CALLING:
-                return String.format(Locale.getDefault(), "叫号 %s %s → 请到%s就诊",
-                        t.ticketNo, t.patientName, t.department);
+                return String.format(Locale.getDefault(), "叫号 %s %s → 请到%s%s就诊",
+                        t.ticketNo, t.patientName, t.department, HospitalDepartments.roomNameOf(t.roomNo));
             case TicketState.FINISHED:
                 return String.format(Locale.getDefault(), "%s %s 就诊完成", t.ticketNo, t.patientName);
-            case TicketState.SKIPPED:
-                return String.format(Locale.getDefault(), "%s %s 过号（未到诊室）", t.ticketNo, t.patientName);
             case TicketState.CANCELLED:
                 return String.format(Locale.getDefault(), "%s %s 已退号", t.ticketNo, t.patientName);
             default:

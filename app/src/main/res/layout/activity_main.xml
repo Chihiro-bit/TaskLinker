@@ -103,7 +103,7 @@
         </LinearLayout>
     </LinearLayout>
 
-    <!-- ============ 医生工作站 ============ -->
+    <!-- ============ 医生工作站（多诊室） ============ -->
     <LinearLayout
         android:id="@+id/panelDoctor"
         android:layout_width="match_parent"
@@ -123,15 +123,28 @@
                 android:layout_width="100dp"
                 android:layout_height="wrap_content" />
 
-            <TextView
-                android:id="@+id/tvCurrent"
-                android:layout_width="0dp"
+            <Spinner
+                android:id="@+id/spRoom"
+                android:layout_width="120dp"
                 android:layout_height="wrap_content"
-                android:layout_marginStart="8dp"
-                android:layout_weight="1"
-                android:text="当前就诊：无"
-                android:textSize="16sp" />
+                android:layout_marginStart="8dp" />
         </LinearLayout>
+
+        <TextView
+            android:id="@+id/tvRoom1"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="1号诊室：空闲"
+            android:textSize="14sp" />
+
+        <TextView
+            android:id="@+id/tvRoom2"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="2号诊室：空闲"
+            android:textSize="14sp" />
 
         <LinearLayout
             android:layout_width="match_parent"
@@ -190,6 +203,14 @@
                 android:layout_height="wrap_content"
                 android:layout_marginStart="8dp"
                 android:text="刷新" />
+
+            <CheckBox
+                android:id="@+id/cbVoice"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:checked="true"
+                android:text="语音播报" />
         </LinearLayout>
 
         <TextView
@@ -197,8 +218,8 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:text="当前叫号：无"
-            android:textSize="22sp"
+            android:text="当前就诊：无"
+            android:textSize="20sp"
             android:textStyle="bold" />
 
         <androidx.recyclerview.widget.RecyclerView

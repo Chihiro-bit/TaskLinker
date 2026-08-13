@@ -23,28 +23,37 @@ import java.util.List;
 import java.util.PriorityQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 医院叫号调度服务，运行在独立进程 ":scheduler" 中（见 AndroidManifest）。
  *
  * 领域模型：
- *  - 每个科室一个叫号队列（等待队列 + 当前就诊号），
- *    叫号由医生工作站客户端触发，全程由客户端交互驱动；
- *  - 优先号（老人/急诊）插队：等待队列按"优先级降序 → 取号时间升序"排序，
- *    比较器必须全序（见 TICKET_COMPARATOR 的第三级 taskId 兜底）。
+ *  - 每个科室 N 个诊室（Room），多诊室可并发就诊；
+ *  - 等待队列按"优先级降序 → 取号时间升序 → ticketId 升序"全序排序，
+ *    优先号（老人/急诊）插队；
+ *  - 叫号超时自动过号：callNext 后 AUTO_SKIP_TIMEOUT_SECONDS 内未完成/过号，
+ *    由 ScheduledExecutorService 触发自动放回队尾；
+ *  - 过号重排：过号（手动或超时）不是终态——skippedCount++ 并重置取号时间，
+ *    排到同优先级队尾继续等待叫号，患者不会丢号。
  *
- * 关键设计（与通用任务调度版一致的工程要点）：
+ * 工程要点（与前一版本一致）：
  *  1. AIDL 方法由 Binder 线程池并发调用，共享结构使用线程安全容器；
- *  2. 每个科室队列对象本身即锁：所有状态转换（取号/叫号/完成/过号/退号）
- *     都在 synchronized(queue) 内完成，锁外才做广播，避免持锁做 Binder 调用；
- *  3. 回调用 RemoteCallbackList 管理，内部为每个回调注册 IBinder 死亡监听，
- *     客户端进程被杀后自动移除（onCallbackDied），不持有失效 Binder；
+ *  2. 每个科室队列对象本身即锁：所有状态转换都在 synchronized(queue) 内完成，
+ *     锁外才做定时器操作与广播，避免持锁做耗时/跨进程操作；
+ *  3. 回调用 RemoteCallbackList 管理，客户端进程被杀自动清理（onCallbackDied）；
  *  4. 广播为 oneway 异步事务，慢客户端不会阻塞服务端。
  */
 public class TaskSchedulerService extends Service {
 
     private static final String TAG = "TaskScheduler";
+
+    /** 叫号超时自动过号：医生叫号后 N 秒内未完成/过号，自动放回队尾 */
+    private static final long AUTO_SKIP_TIMEOUT_SECONDS = 20L;
 
     /**
      * 回调列表：子类化 RemoteCallbackList 以挂接死亡回调。
@@ -59,6 +68,16 @@ public class TaskSchedulerService extends Service {
         }
     }
 
+    /** 诊室：一个科室多个诊室，可同时各有一位患者就诊 */
+    private static class Room {
+        final int roomNo;
+        TicketInfo current; // 该诊室当前就诊中的号（null 表示空闲）
+
+        Room(int roomNo) {
+            this.roomNo = roomNo;
+        }
+    }
+
     /**
      * 单个科室的叫号队列。对象本身即同步锁：
      * 所有队列与号状态修改都持有该锁，保证多 Binder 线程并发下的状态机一致性。
@@ -67,18 +86,26 @@ public class TaskSchedulerService extends Service {
         final String department;
         final String prefix;
         final PriorityQueue<TicketInfo> waiting; // 等待中的号（按叫号顺序出队）
-        final AtomicInteger counter = new AtomicInteger(1); // 序号从 001 开始
-        TicketInfo current; // 当前就诊中的号（一科同时只有一位患者就诊）
+        final Room[] rooms;                       // 诊室（多诊室并发就诊）
+        final AtomicInteger counter = new AtomicInteger(1);
 
-        DepartmentQueue(String department, String prefix) {
+        DepartmentQueue(String department, String prefix, int roomCount) {
             this.department = department;
             this.prefix = prefix;
             this.waiting = new PriorityQueue<>(TICKET_COMPARATOR);
+            this.rooms = new Room[roomCount];
+            for (int i = 0; i < roomCount; i++) {
+                rooms[i] = new Room(i + 1);
+            }
         }
 
         String nextTicketNo() {
             return String.format(java.util.Locale.getDefault(), "%s-%03d",
                     prefix, counter.getAndIncrement());
+        }
+
+        Room room(int roomNo) {
+            return (roomNo >= 1 && roomNo <= rooms.length) ? rooms[roomNo - 1] : null;
         }
     }
 
@@ -100,21 +127,25 @@ public class TaskSchedulerService extends Service {
     private final ConcurrentHashMap<Integer, TicketInfo> tickets = new ConcurrentHashMap<>();
     private final AtomicInteger ticketIdGenerator = new AtomicInteger(0);
 
-    /**
-     * 广播期间发现的失效回调。RemoteCallbackList 不允许在 beginBroadcast 期间
-     * 调用 unregister（会抛 IllegalStateException），先记账、广播结束后统一移除。
-     */
+    /** 广播期间发现的失效回调。RemoteCallbackList 不允许在广播期间 unregister，先记账后统一移除 */
     private final ConcurrentLinkedQueue<ITaskCallback> deadCallbacks = new ConcurrentLinkedQueue<>();
+
+    /** 叫号超时自动过号的定时器（单线程足够：任务只是抢锁做一次状态检查） */
+    private final ScheduledExecutorService autoSkipExecutor =
+            Executors.newScheduledThreadPool(1, r -> new Thread(r, "AutoSkip"));
+    private final ConcurrentHashMap<Integer, ScheduledFuture<?>> autoSkipTimers = new ConcurrentHashMap<>();
 
     @Override
     public void onCreate() {
         super.onCreate();
         for (String department : HospitalDepartments.ALL) {
-            departments.put(department,
-                    new DepartmentQueue(department, HospitalDepartments.prefixOf(department)));
+            departments.put(department, new DepartmentQueue(department,
+                    HospitalDepartments.prefixOf(department), HospitalDepartments.ROOMS_PER_DEPARTMENT));
         }
         Log.i(TAG, "TaskSchedulerService created, pid=" + Process.myPid()
-                + ", departments=" + HospitalDepartments.ALL.length);
+                + ", departments=" + HospitalDepartments.ALL.length
+                + ", roomsPerDepartment=" + HospitalDepartments.ROOMS_PER_DEPARTMENT
+                + ", autoSkipTimeout=" + AUTO_SKIP_TIMEOUT_SECONDS + "s");
     }
 
     // ---------------- AIDL 实现（运行在 Binder 线程池） ----------------
@@ -133,6 +164,8 @@ public class TaskSchedulerService extends Service {
             if (ticket.createTime <= 0) ticket.createTime = System.currentTimeMillis();
             if (ticket.priority <= 0) ticket.priority = TicketPriority.NORMAL;
             ticket.state = TicketState.WAITING;
+            ticket.roomNo = 0;
+            ticket.skippedCount = 0;
 
             synchronized (q) {
                 q.waiting.offer(ticket);
@@ -146,37 +179,46 @@ public class TaskSchedulerService extends Service {
         }
 
         @Override
-        public int callNext(String department) {
+        public int callNext(String department, int roomNo) {
             DepartmentQueue q = departments.get(department);
             if (q == null) return -1;
+            Room room = q.room(roomNo);
+            if (room == null) return -1;
             TicketInfo called;
             synchronized (q) {
-                if (q.current != null) {
-                    // 同一科室同时只有一位患者就诊，先完成/过号才能叫下一位
-                    Log.w(TAG, "callNext " + department + " rejected: " + q.current.ticketNo + " 就诊中");
+                if (room.current != null) {
+                    // 该诊室仍有患者就诊中，先完成/过号才能叫下一位
+                    Log.w(TAG, "callNext " + department + " " + HospitalDepartments.roomNameOf(roomNo)
+                            + " rejected: " + room.current.ticketNo + " 就诊中");
                     return -1;
                 }
                 called = q.waiting.poll();
                 if (called == null) {
-                    Log.i(TAG, "callNext " + department + " rejected: queue empty");
+                    Log.i(TAG, "callNext " + department + " " + HospitalDepartments.roomNameOf(roomNo)
+                            + " rejected: queue empty");
                     return -1;
                 }
                 called.state = TicketState.CALLING;
-                q.current = called;
+                called.roomNo = roomNo;
+                room.current = called;
             }
-            Log.i(TAG, "callNext " + called.ticketNo + " " + called.patientName + " → " + department);
+            // 锁外：启动超时自动过号定时器 + 广播
+            scheduleAutoSkip(called.ticketId);
+            Log.i(TAG, "callNext " + called.ticketNo + " " + called.patientName
+                    + " → " + department + HospitalDepartments.roomNameOf(roomNo)
+                    + "（" + AUTO_SKIP_TIMEOUT_SECONDS + "s 未处理将自动过号重排）");
             broadcast(called);
             return called.ticketId;
         }
 
         @Override
         public boolean completeTicket(int ticketId) {
-            return finishCurrent(ticketId, TicketState.FINISHED, "就诊完成");
+            return finishTicket(ticketId, false);
         }
 
         @Override
         public boolean skipTicket(int ticketId) {
-            return finishCurrent(ticketId, TicketState.SKIPPED, "过号");
+            return finishTicket(ticketId, true);
         }
 
         @Override
@@ -188,7 +230,7 @@ public class TaskSchedulerService extends Service {
             boolean result = false;
             synchronized (q) {
                 if (t.state != TicketState.WAITING) {
-                    // 只有排队中的号可退；就诊中的号由医生完成/过号
+                    // 只有排队中的号可退；就诊中的号由医生完成/过号（或超时自动过号）
                     return false;
                 }
                 t.state = TicketState.CANCELLED;
@@ -218,10 +260,13 @@ public class TaskSchedulerService extends Service {
             if (q == null) return null;
             List<TicketInfo> snapshot = new ArrayList<>();
             synchronized (q) {
-                if (q.current != null) {
-                    snapshot.add(q.current.copy()); // 首位：正在就诊
+                // 前部：各诊室正在就诊的号（按诊室顺序，多诊室并发）
+                for (Room room : q.rooms) {
+                    if (room.current != null) {
+                        snapshot.add(room.current.copy());
+                    }
                 }
-                // PriorityQueue 迭代是无序的，展示前按叫号顺序排序
+                // 后部：等待队列（PriorityQueue 迭代无序，展示前按叫号顺序排序）
                 List<TicketInfo> waiting = new ArrayList<>(q.waiting);
                 waiting.sort(TICKET_COMPARATOR);
                 for (TicketInfo t : waiting) {
@@ -249,8 +294,10 @@ public class TaskSchedulerService extends Service {
         }
     };
 
-    /** 就诊中的号收尾（完成/过号）：锁内转换状态并清空当前就诊位，锁外广播 */
-    private boolean finishCurrent(int ticketId, int state, String action) {
+    // ---------------- 就诊收尾：完成 / 过号重排 ----------------
+
+    /** 就诊中的号收尾。skip=true 过号（放回队尾重排）；否则就诊完成 */
+    private boolean finishTicket(int ticketId, boolean skip) {
         TicketInfo t = tickets.get(ticketId);
         if (t == null) return false;
         DepartmentQueue q = departments.get(t.department);
@@ -258,14 +305,75 @@ public class TaskSchedulerService extends Service {
         boolean result = false;
         synchronized (q) {
             if (t.state != TicketState.CALLING) return false;
-            t.state = state;
-            q.current = null;
+            if (skip) {
+                requeueSkippedLocked(q, t); // 过号：重排回队尾
+            } else {
+                t.state = TicketState.FINISHED;
+                t.roomNo = 0;
+                clearRoomLocked(q, t);
+            }
             result = true;
         }
-        Log.i(TAG, action + " " + t.ticketNo + " " + t.patientName);
+        cancelAutoSkip(ticketId); // 定时器使命结束
+        Log.i(TAG, (skip ? "skipTicket 过号重排（第" + t.skippedCount + "次）" : "completeTicket 就诊完成")
+                + " " + t.ticketNo + " " + t.patientName);
         broadcast(t);
         return result;
     }
+
+    /** 过号重排（必须在队列锁内调用）：计数 +1、重置取号时间（排到同优先级队尾）、回到等待队列 */
+    private void requeueSkippedLocked(DepartmentQueue q, TicketInfo t) {
+        t.skippedCount++;
+        t.createTime = System.currentTimeMillis(); // 时间重置 → 比较器自然排到同优先级尾部
+        t.state = TicketState.WAITING;
+        t.roomNo = 0;
+        clearRoomLocked(q, t);
+        q.waiting.offer(t);
+    }
+
+    private void clearRoomLocked(DepartmentQueue q, TicketInfo t) {
+        for (Room room : q.rooms) {
+            if (room.current == t) {
+                room.current = null;
+                return;
+            }
+        }
+    }
+
+    // ---------------- 叫号超时自动过号（ScheduledExecutorService） ----------------
+
+    private void scheduleAutoSkip(int ticketId) {
+        ScheduledFuture<?> future = autoSkipExecutor.schedule(
+                () -> autoSkipIfStillCalling(ticketId),
+                AUTO_SKIP_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        autoSkipTimers.put(ticketId, future);
+    }
+
+    /** 医生及时处理（完成/过号）后取消定时器，避免误触发 */
+    private void cancelAutoSkip(int ticketId) {
+        ScheduledFuture<?> future = autoSkipTimers.remove(ticketId);
+        if (future != null) {
+            future.cancel(false);
+        }
+    }
+
+    /** 定时器触发：号仍处于就诊中 → 自动过号重排（锁内检查，与医生操作竞争同一把锁，状态机不会乱） */
+    private void autoSkipIfStillCalling(int ticketId) {
+        TicketInfo t = tickets.get(ticketId);
+        if (t == null) return;
+        DepartmentQueue q = departments.get(t.department);
+        if (q == null) return;
+        synchronized (q) {
+            if (t.state != TicketState.CALLING) return; // 已被医生处理，忽略
+            requeueSkippedLocked(q, t);
+        }
+        autoSkipTimers.remove(ticketId);
+        Log.w(TAG, "autoSkip timeout: " + t.ticketNo + " " + t.patientName
+                + " 超时未到，自动过号重排（第" + t.skippedCount + "次）");
+        broadcast(t);
+    }
+
+    // ---------------- 生命周期 ----------------
 
     @Override
     public IBinder onBind(Intent intent) {
@@ -276,7 +384,9 @@ public class TaskSchedulerService extends Service {
 
     @Override
     public void onDestroy() {
-        Log.i(TAG, "onDestroy: clear " + tickets.size() + " tickets");
+        Log.i(TAG, "onDestroy: clear " + tickets.size() + " tickets, shutdown autoSkip executor");
+        autoSkipExecutor.shutdownNow();
+        autoSkipTimers.clear();
         callbacks.kill(); // 释放所有已注册回调
         tickets.clear();
         departments.clear();

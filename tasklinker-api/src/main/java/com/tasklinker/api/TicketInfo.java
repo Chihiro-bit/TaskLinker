@@ -15,7 +15,9 @@ import java.util.Locale;
  *  - department   科室（内科/外科/儿科，见 HospitalDepartments）
  *  - priority     优先级：普通号 / 优先号（老人、急诊），优先号插队（见 TicketPriority）
  *  - createTime   取号时间戳，同优先级按先来后到排序
- *  - state        排队号状态（排队中/就诊中/就诊完成/过号/已退号，见 TicketState）
+ *  - state        排队号状态（排队中/就诊中/就诊完成/已退号，见 TicketState）
+ *  - roomNo       当前所在诊室（1/2/...，排队中与已结束为 0）
+ *  - skippedCount 过号重排次数（过号不丢号，放回队尾继续排队）
  */
 public class TicketInfo implements Parcelable {
 
@@ -26,6 +28,8 @@ public class TicketInfo implements Parcelable {
     public int priority;
     public long createTime;
     public int state;
+    public int roomNo;
+    public int skippedCount;
 
     public TicketInfo() {
         ticketNo = "";
@@ -33,6 +37,8 @@ public class TicketInfo implements Parcelable {
         department = "";
         priority = TicketPriority.NORMAL;
         state = TicketState.WAITING;
+        roomNo = 0;
+        skippedCount = 0;
     }
 
     protected TicketInfo(Parcel in) {
@@ -43,6 +49,8 @@ public class TicketInfo implements Parcelable {
         priority = in.readInt();
         createTime = in.readLong();
         state = in.readInt();
+        roomNo = in.readInt();
+        skippedCount = in.readInt();
     }
 
     /** 拷贝一份快照（queryTicket / queryQueue 返回时使用，避免读到并发中间态） */
@@ -55,6 +63,8 @@ public class TicketInfo implements Parcelable {
         t.priority = priority;
         t.createTime = createTime;
         t.state = state;
+        t.roomNo = roomNo;
+        t.skippedCount = skippedCount;
         return t;
     }
 
@@ -67,6 +77,8 @@ public class TicketInfo implements Parcelable {
         dest.writeInt(priority);
         dest.writeLong(createTime);
         dest.writeInt(state);
+        dest.writeInt(roomNo);
+        dest.writeInt(skippedCount);
     }
 
     @Override

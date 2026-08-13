@@ -178,12 +178,12 @@ public class TaskSchedulerConnection implements ServiceConnection {
         }
     }
 
-    /** 叫下一位：返回被叫 ticketId；队列为空或当前患者未处理完返回 -1 */
-    public int callNext(String department) {
+    /** 指定诊室叫下一位：返回被叫 ticketId；队列为空或该诊室患者未处理完返回 -1 */
+    public int callNext(String department, int roomNo) {
         ITaskScheduler s = scheduler;
         if (s == null) return -1;
         try {
-            return s.callNext(department);
+            return s.callNext(department, roomNo);
         } catch (RemoteException e) {
             handleDisconnect("叫号失败: " + e.getMessage());
             return -1;
@@ -202,7 +202,7 @@ public class TaskSchedulerConnection implements ServiceConnection {
         }
     }
 
-    /** 过号（患者未到诊室） */
+    /** 过号（患者未到诊室）：服务端会放回同优先级队尾重新排队 */
     public boolean skipTicket(int ticketId) {
         ITaskScheduler s = scheduler;
         if (s == null) return false;

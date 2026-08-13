@@ -11,17 +11,14 @@ public final class TicketState {
     public static final int CALLING = 1;
     /** 就诊完成 */
     public static final int FINISHED = 2;
-    /** 过号（叫号后患者未到诊室） */
-    public static final int SKIPPED = 3;
     /** 已退号 */
-    public static final int CANCELLED = 4;
+    public static final int CANCELLED = 3;
 
     public static String nameOf(int state) {
         switch (state) {
             case WAITING:   return "排队中";
             case CALLING:   return "就诊中";
             case FINISHED:  return "就诊完成";
-            case SKIPPED:   return "过号";
             case CANCELLED: return "已退号";
             default:        return "未知(" + state + ")";
         }
